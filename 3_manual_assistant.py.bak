@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""
+TOOL 3: MANUAL TRADING ASSISTANT
+"""
+
+import ccxt
+import pandas as pd
+import time
+from datetime import datetime
+from colorama import Fore, Style, init
+from tabulate import tabulate
+import getpass
+
+init(autoreset=True)
+
+class TradingAssistant:
+    def __init__(self, symbols=['BTC/USDT', 'ETH/USDT'], api_key=None, api_secret=None):
+        if api_key and api_secret:
+            self.exchange = ccxt.gate({
+                'apiKey': api_key, 'secret': api_secret, 'enableRateLimit': True
+            })
+            self.trading_enabled = True
+            print(f"{Fore.GREEN}Connected with API")
+        else:
+            self.exchange = ccxt.gate({'enableRateLimit': True})
+            self.trading_enabled = False
+            print(f"{Fore.YELLOW}Read-only mode")
+        
+        self.symbols = symbols
+        self.signals = []
+    
+    def calculate_indicators(self, symbol):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, '1m', limit=50)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            
+            current_price = df['close'].iloc[-1]
+            
+            # RSI
+            prices = df['close'].tolist()
+            deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+            gains = [d if d > 0 else 0 for d in deltas]
+            losses = [-d if d < 0 else 0 for d in deltas]
+            avg_gain = sum(gains[-7:]) / 7
+            avg_loss = sum(losses[-7:]) / 7
+            rs = avg_gain / avg_loss if avg_loss != 0 else 100
+            rsi = 100 - (100 / (1 + rs))
+            
+            # Volume
+            avg_volume = df['volume'].tail(10).mean()
+            volume_ratio = df['volume'].iloc[-1] / avg_volume if avg_volume > 0 else 1
+            
+            # VWAP
+            df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
+            vwap = df['vwap'].iloc[-1]
+            
+            # Bollinger
+            sma = df['close'].tail(20).mean()
+            std = df['close'].tail(20).std()
+            bb_upper = sma + (2 * std)
+            bb_lower = sma - (2 * std)
+            
+            # Order book
+            orderbook = self.exchange.fetch_order_book(symbol, limit=10)
+            bid_vol = sum([bid[1] for bid in orderbook['bids'][:5]])
+            ask_vol = sum([ask[1] for ask in orderbook['asks'][:5]])
+            ob_imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol) if (bid_vol + ask_vol) > 0 else 0
+            
+            best_bid = orderbook['bids'][0][0] if orderbook['bids'] else current_price
+            best_ask = orderbook['asks'][0][0] if orderbook['asks'] else current_price
+            spread = ((best_ask - best_bid) / best_bid) * 100
+            
+            return {
+                'symbol': symbol, 'price': current_price, 'rsi': rsi,
+                'volume_ratio': volume_ratio, 'vwap': vwap,
+                'bb_upper': bb_upper, 'bb_lower': bb_lower,
+                'ob_imbalance': ob_imbalance, 'spread': spread,
+                'best_bid': best_bid, 'best_ask': best_ask
+            }
+        except Exception as e:
+            print(f"{Fore.RED}Error: {e}")
+            return None
+    
+    def analyze_signal(self, data):
+        score = 0
+        signals = []
+        
+        if data['rsi'] < 30:
+            score += 3
+            signals.append(("RSI Oversold", f"{data['rsi']:.1f}", "STRONG BUY"))
+        elif data['rsi'] > 70:
+            score -= 3
+            signals.append(("RSI Overbought", f"{data['rsi']:.1f}", "STRONG SELL"))
+        
+        if data['price'] < data['bb_lower']:
+            score += 2
+            signals.append(("Below BB", f"${data['bb_lower']:,.2f}", "BUY"))
+        elif data['price'] > data['bb_upper']:
+            score -= 2
+            signals.append(("Above BB", f"${data['bb_upper']:,.2f}", "SELL"))
+        
+        if data['ob_imbalance'] > 0.4:
+            score += 2
+            signals.append(("Strong Bids", f"{data['ob_imbalance']:.2f}", "BUY"))
+        elif data['ob_imbalance'] < -0.4:
+            score -= 2
+            signals.append(("Strong Asks", f"{data['ob_imbalance']:.2f}", "SELL"))
+        
+        if data['volume_ratio'] > 2.0:
+            score += 1
+            signals.append(("High Volume", f"{data['volume_ratio']:.1f}x", "WATCH"))
+        
+        if score >= 5:
+            action = "STRONG BUY"
+            color = Fore.GREEN
+        elif score >= 3:
+            action = "BUY"
+            color = Fore.GREEN
+        elif score <= -5:
+            action = "STRONG SELL"
+            color = Fore.RED
+        elif score <= -3:
+            action = "SELL"
+            color = Fore.RED
+        else:
+            action = "HOLD"
+            color = Fore.YELLOW
+        
+        return {'action': action, 'score': score, 'signals': signals, 'color': color, 'data': data}
+    
+    def display_signal(self, analysis):
+        data = analysis['data']
+        
+        print(f"\n{Fore.CYAN}{'='*100}")
+        print(f"{Fore.YELLOW}SIGNAL: {data['symbol']}")
+        print(f"{Fore.CYAN}{'='*100}")
+        print(f"\n{Fore.WHITE}Price: ${data['price']:,.2f}")
+        print(f"Bid: ${data['best_bid']:,.2f} | Ask: ${data['best_ask']:,.2f} | Spread: {data['spread']:.3f}%")
+        
+        indicators = [
+            ['RSI', f"{data['rsi']:.2f}"],
+            ['Volume Ratio', f"{data['volume_ratio']:.2f}x"],
+            ['Order Book', f"{data['ob_imbalance']:+.3f}"]
+        ]
+        print(f"\n{tabulate(indicators, headers=['Indicator', 'Value'], tablefmt='grid')}")
+        
+        if analysis['signals']:
+            print(f"\n{Fore.CYAN}Signals:")
+            signal_table = [[s[0], s[1], s[2]] for s in analysis['signals']]
+            print(tabulate(signal_table, headers=['Signal', 'Value', 'Direction'], tablefmt='grid'))
+        
+        print(f"\n{analysis['color']}{'='*100}")
+        print(f"{analysis['color']}RECOMMENDATION: {analysis['action']} (Score: {analysis['score']})")
+        print(f"{analysis['color']}{'='*100}")
+        
+        if analysis['action'] in ['BUY', 'STRONG BUY']:
+            stop = data['price'] * 0.999
+            target = data['price'] * 1.0015
+            print(f"\n{Fore.YELLOW}Suggested Setup:")
+            print(f"Entry: ${data['price']:,.2f}")
+            print(f"Stop: ${stop:,.2f} (-0.10%)")
+            print(f"Target: ${target:,.2f} (+0.15%)")
+    
+    def run_interactive(self):
+        print(f"{Fore.CYAN}{'='*100}")
+        print(f"{Fore.YELLOW}MANUAL TRADING ASSISTANT")
+        print(f"{Fore.CYAN}{'='*100}")
+        print(f"Mode: {'ENABLED' if self.trading_enabled else 'READ-ONLY'}")
+        print("\nCommands: ENTER=refresh | quit=exit")
+        print(f"{Fore.CYAN}{'='*100}\n")
+        
+        try:
+            while True:
+                print(f"\n{Fore.MAGENTA}[{datetime.now().strftime('%H:%M:%S')}] Analyzing...")
+                
+                for symbol in self.symbols:
+                    data = self.calculate_indicators(symbol)
+                    if data:
+                        analysis = self.analyze_signal(data)
+                        self.display_signal(analysis)
+                    time.sleep(2)
+                
+                print(f"\n{Fore.YELLOW}Press ENTER to refresh (or 'quit'): {Fore.WHITE}", end='')
+                cmd = input().strip().lower()
+                if cmd == 'quit':
+                    break
+        except KeyboardInterrupt:
+            print(f"\n{Fore.YELLOW}Stopped.")
+
+if __name__ == "__main__":
+    use_api = input("Connect Gate.io API? (yes/no): ").strip().lower()
+    
+    api_key = None
+    api_secret = None
+    
+    if use_api == 'yes':
+        print(f"{Fore.RED}WARNING: Only use API keys with SPOT trading permissions, NO withdrawals!")
+        api_key = getpass.getpass("API Key: ")
+        api_secret = getpass.getpass("Secret: ")
+    
+    assistant = TradingAssistant(symbols=['BTC/USDT', 'ETH/USDT'], api_key=api_key, api_secret=api_secret)
+    assistant.run_interactive()

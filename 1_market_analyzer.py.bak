@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""
+TOOL 1: MARKET DATA ANALYZER (Read-Only Educational Tool)
+"""
+
+import ccxt
+import pandas as pd
+import time
+from datetime import datetime
+from colorama import Fore, Style, init
+from tabulate import tabulate
+
+init(autoreset=True)
+
+class MarketAnalyzer:
+    def __init__(self, symbols=['BTC/USDT', 'ETH/USDT']):
+        self.exchange = ccxt.gate({'enableRateLimit': True})
+        self.symbols = symbols
+        self.signal_history = []
+        
+    def calculate_rsi(self, prices, period=14):
+        if len(prices) < period + 1:
+            return 50
+        deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+        gains = [d if d > 0 else 0 for d in deltas]
+        losses = [-d if d < 0 else 0 for d in deltas]
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        if avg_loss == 0:
+            return 100
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+    
+    def get_orderbook_imbalance(self, symbol):
+        try:
+            orderbook = self.exchange.fetch_order_book(symbol, limit=10)
+            bid_volume = sum([bid[1] for bid in orderbook['bids'][:5]])
+            ask_volume = sum([ask[1] for ask in orderbook['asks'][:5]])
+            total = bid_volume + ask_volume
+            return (bid_volume - ask_volume) / total if total > 0 else 0
+        except:
+            return 0
+    
+    def analyze_symbol(self, symbol):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, '1m', limit=50)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            
+            current_price = df['close'].iloc[-1]
+            prices = df['close'].tolist()
+            rsi = self.calculate_rsi(prices, period=7)
+            
+            avg_volume = df['volume'].tail(10).mean()
+            current_volume = df['volume'].iloc[-1]
+            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+            
+            price_change_1m = ((current_price - df['close'].iloc[-2]) / df['close'].iloc[-2]) * 100
+            
+            df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
+            vwap = df['vwap'].iloc[-1]
+            dist_vwap = ((current_price - vwap) / vwap) * 100
+            
+            ob_imbalance = self.get_orderbook_imbalance(symbol)
+            signal = self.generate_signal(rsi, ob_imbalance, volume_ratio, dist_vwap, price_change_1m)
+            
+            return {
+                'symbol': symbol, 'price': current_price, 'rsi': rsi,
+                'volume_ratio': volume_ratio, 'price_change_1m': price_change_1m,
+                'dist_vwap': dist_vwap, 'ob_imbalance': ob_imbalance, 'signal': signal
+            }
+        except Exception as e:
+            print(f"{Fore.RED}Error: {e}")
+            return None
+    
+    def generate_signal(self, rsi, ob_imbalance, volume_ratio, dist_vwap, price_change):
+        score = 0
+        reasons = []
+        if rsi < 35:
+            score += 2
+            reasons.append("Oversold RSI")
+        elif rsi > 65:
+            score -= 2
+            reasons.append("Overbought RSI")
+        if ob_imbalance > 0.3:
+            score += 2
+            reasons.append("Strong bid pressure")
+        elif ob_imbalance < -0.3:
+            score -= 2
+            reasons.append("Strong ask pressure")
+        if volume_ratio > 1.5:
+            score += 1
+            reasons.append("High volume")
+        if -0.1 < dist_vwap < 0.1:
+            score += 1
+            reasons.append("Near VWAP")
+        
+        if score >= 4:
+            return ('BUY', score, reasons)
+        elif score <= -4:
+            return ('SELL', score, reasons)
+        return ('WAIT', score, reasons)
+    
+    def display_analysis(self, analysis):
+        if not analysis:
+            return
+        print(f"\n{Fore.CYAN}{'='*80}")
+        print(f"{Fore.YELLOW}Symbol: {analysis['symbol']} | Price: ${analysis['price']:,.2f}")
+        print(f"{Fore.CYAN}{'='*80}")
+        
+        indicators = [
+            ['RSI (7)', f"{analysis['rsi']:.2f}"],
+            ['Volume Ratio', f"{analysis['volume_ratio']:.2f}x"],
+            ['1m Change', f"{analysis['price_change_1m']:.3f}%"],
+            ['Distance from VWAP', f"{analysis['dist_vwap']:.3f}%"],
+            ['Order Book Imbalance', f"{analysis['ob_imbalance']:.3f}"]
+        ]
+        print(tabulate(indicators, headers=['Indicator', 'Value'], tablefmt='grid'))
+        
+        signal_type, score, reasons = analysis['signal']
+        color = Fore.GREEN if signal_type == 'BUY' else Fore.RED if signal_type == 'SELL' else Fore.YELLOW
+        print(f"\n{color}{'='*80}")
+        print(f"{color}SIGNAL: {signal_type} | Score: {score}")
+        print(f"{color}{'='*80}")
+        print(f"{Fore.WHITE}Reasons: {', '.join(reasons) if reasons else 'Neutral'}")
+    
+    def run(self, interval=60):
+        print(f"{Fore.CYAN}{'='*80}")
+        print(f"{Fore.YELLOW}MARKET DATA ANALYZER - READ ONLY")
+        print(f"{Fore.CYAN}{'='*80}")
+        print(f"Press Ctrl+C to stop\n")
+        
+        try:
+            while True:
+                print(f"\n{Fore.MAGENTA}[{datetime.now().strftime('%H:%M:%S')}] Analyzing...")
+                for symbol in self.symbols:
+                    analysis = self.analyze_symbol(symbol)
+                    if analysis:
+                        self.display_analysis(analysis)
+                    time.sleep(2)
+                print(f"\n{Fore.YELLOW}Next update in {interval} seconds...")
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print(f"\n{Fore.YELLOW}Stopped.")
+
+if __name__ == "__main__":
+    analyzer = MarketAnalyzer(symbols=['BTC/USDT', 'ETH/USDT'])
+    analyzer.run(interval=60)

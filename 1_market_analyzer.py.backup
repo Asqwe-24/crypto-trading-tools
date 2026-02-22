@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+import ccxt, pandas as pd, time
+from datetime import datetime
+from colorama import Fore, init
+from tabulate import tabulate
+init(autoreset=True)
+
+class MarketAnalyzer:
+    def __init__(self, symbols=['BTC/USDT', 'ETH/USDT']):
+        self.exchange = ccxt.gate({'enableRateLimit': True})
+        self.symbols = symbols
+        
+    def calculate_rsi(self, prices, period=7):
+        if len(prices) < period + 1: return 50
+        deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+        gains = [d if d > 0 else 0 for d in deltas]
+        losses = [-d if d < 0 else 0 for d in deltas]
+        avg_gain, avg_loss = sum(gains[-period:])/period, sum(losses[-period:])/period
+        if avg_loss == 0: return 100
+        return 100 - (100 / (1 + avg_gain/avg_loss))
+    
+    def get_orderbook_imbalance(self, symbol):
+        try:
+            orderbook = self.exchange.fetch_order_book(symbol, limit=10)
+            bid_vol = sum([b[1] for b in orderbook['bids'][:5]])
+            ask_vol = sum([a[1] for a in orderbook['asks'][:5]])
+            total = bid_vol + ask_vol
+            return (bid_vol - ask_vol) / total if total > 0 else 0
+        except: return 0
+    
+    def analyze_symbol(self, symbol):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, '1m', limit=50)
+            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+            price = df['close'].iloc[-1]
+            rsi = self.calculate_rsi(df['close'].tolist())
+            vol_ratio = df['volume'].iloc[-1] / df['volume'].tail(10).mean()
+            df['vwap'] = (df['volume']*(df['high']+df['low']+df['close'])/3).cumsum()/df['volume'].cumsum()
+            dist_vwap = ((price - df['vwap'].iloc[-1])/df['vwap'].iloc[-1])*100
+            ob_imb = self.get_orderbook_imbalance(symbol)
+            
+            score = 0
+            if rsi < 35: score += 2
+            elif rsi > 65: score -= 2
+            if ob_imb > 0.3: score += 2
+            elif ob_imb < -0.3: score -= 2
+            if vol_ratio > 1.5: score += 1
+            
+            signal = 'BUY' if score >= 4 else 'SELL' if score <= -4 else 'WAIT'
+            color = Fore.GREEN if signal=='BUY' else Fore.RED if signal=='SELL' else Fore.YELLOW
+            
+            print(f"\n{Fore.CYAN}{'='*90}")
+            print(f"{Fore.YELLOW}{symbol} | Current Price: ${price:,.2f}")
+            print(f"{Fore.CYAN}{'='*90}")
+            print(tabulate([
+                ['RSI (7)', f"{rsi:.2f}"],
+                ['Volume Ratio', f"{vol_ratio:.2f}x"],
+                ['VWAP Distance', f"{dist_vwap:.2f}%"],
+                ['Order Book Imbalance', f"{ob_imb:.2f}"]
+            ], headers=['Indicator','Value'], tablefmt='grid'))
+            print(f"\n{color}{'='*90}")
+            print(f"{color}SIGNAL: {signal} (Strength Score: {score})")
+            print(f"{color}{'='*90}{Fore.RESET}")
+            
+            # Show TP/SL for actionable signals
+            if signal == 'BUY':
+                stop_loss = price * 0.999  # 0.1% stop
+                take_profit = price * 1.0015  # 0.15% target
+                stop_pct = -0.10
+                tp_pct = 0.15
+                
+                print(f"\n{Fore.YELLOW}📊 SUGGESTED TRADE SETUP (LONG):")
+                print(f"{Fore.WHITE}Entry Price:  ${price:,.2f}")
+                print(f"{Fore.RED}Stop Loss:    ${stop_loss:,.2f}  ({stop_pct:.2f}%)")
+                print(f"{Fore.GREEN}Take Profit:  ${take_profit:,.2f}  (+{tp_pct:.2f}%)")
+                print(f"{Fore.CYAN}Risk/Reward:  1:1.5")
+                
+            elif signal == 'SELL':
+                stop_loss = price * 1.001  # 0.1% stop
+                take_profit = price * 0.9985  # 0.15% target
+                stop_pct = 0.10
+                tp_pct = -0.15
+                
+                print(f"\n{Fore.YELLOW}📊 SUGGESTED TRADE SETUP (SHORT):")
+                print(f"{Fore.WHITE}Entry Price:  ${price:,.2f}")
+                print(f"{Fore.RED}Stop Loss:    ${stop_loss:,.2f}  (+{stop_pct:.2f}%)")
+                print(f"{Fore.GREEN}Take Profit:  ${take_profit:,.2f}  ({tp_pct:.2f}%)")
+                print(f"{Fore.CYAN}Risk/Reward:  1:1.5")
+            
+        except Exception as e:
+            print(f"{Fore.RED}Error: {e}")
+    
+    def run(self, interval=60):
+        print(f"{Fore.CYAN}{'='*90}\n{Fore.YELLOW}MARKET DATA ANALYZER - Gate.io\n{Fore.CYAN}{'='*90}\nPress Ctrl+C to stop\n")
+        try:
+            while True:
+                print(f"\n{Fore.MAGENTA}[{datetime.now().strftime('%H:%M:%S')}] Analyzing markets...")
+                for symbol in self.symbols:
+                    self.analyze_symbol(symbol)
+                    time.sleep(2)
+                print(f"\n{Fore.YELLOW}⏰ Next update in {interval} seconds...")
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print(f"\n{Fore.YELLOW}Analyzer stopped.")
+
+if __name__ == "__main__":
+    MarketAnalyzer().run()

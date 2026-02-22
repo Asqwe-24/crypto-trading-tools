@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+import ccxt, pandas as pd, time, json
+from datetime import datetime
+from colorama import Fore, init
+from tabulate import tabulate
+init(autoreset=True)
+
+class PaperBot:
+    def __init__(self, balance=10000):
+        self.exchange = ccxt.gate({'enableRateLimit': True})
+        self.balance = balance
+        self.initial = balance
+        self.positions = []
+        self.trades = []
+        self.symbols = ['BTC/USDT', 'ETH/USDT']
+        self.stop_loss_pct = 0.001  # 0.1%
+        self.take_profit_pct = 0.0015  # 0.15%
+        
+    def analyze(self, symbol):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, '1m', limit=50)
+            df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
+            price = df['c'].iloc[-1]
+            
+            deltas = [df['c'].iloc[i] - df['c'].iloc[i-1] for i in range(1,len(df))]
+            gains = [d if d>0 else 0 for d in deltas]
+            losses = [-d if d<0 else 0 for d in deltas]
+            rsi = 100 - (100/(1 + sum(gains[-7:])/sum(losses[-7:]))) if sum(losses[-7:])>0 else 100
+            
+            ob = self.exchange.fetch_order_book(symbol, limit=10)
+            bid_vol = sum([b[1] for b in ob['bids'][:5]])
+            ask_vol = sum([a[1] for a in ob['asks'][:5]])
+            imb = (bid_vol-ask_vol)/(bid_vol+ask_vol) if (bid_vol+ask_vol)>0 else 0
+            
+            score = 0
+            if rsi < 35: score += 2
+            if imb > 0.3: score += 2
+            
+            return {'symbol':symbol, 'price':price, 'rsi':rsi, 'imb':imb, 'buy':score>=4}
+        except:
+            return None
+    
+    def open_position(self, symbol, price):
+        qty = (self.balance * 0.01) / (price * self.stop_loss_pct)
+        stop_price = price * (1 - self.stop_loss_pct)
+        target_price = price * (1 + self.take_profit_pct)
+        
+        pos = {
+            'symbol': symbol,
+            'price': price,
+            'qty': qty,
+            'stop': stop_price,
+            'target': target_price,
+            'time': datetime.now()
+        }
+        self.positions.append(pos)
+        self.balance -= price * qty
+        
+        print(f"\n{Fore.GREEN}{'='*90}")
+        print(f"{Fore.GREEN}✓ POSITION OPENED")
+        print(f"{Fore.GREEN}{'='*90}")
+        print(f"{Fore.WHITE}Symbol:       {symbol}")
+        print(f"Entry Price:  ${price:,.2f}")
+        print(f"Quantity:     {qty:.6f}")
+        print(f"Position Val: ${price * qty:,.2f}")
+        print(f"{Fore.RED}Stop Loss:    ${stop_price:,.2f}  (-{self.stop_loss_pct*100:.2f}%)")
+        print(f"{Fore.GREEN}Take Profit:  ${target_price:,.2f}  (+{self.take_profit_pct*100:.2f}%)")
+        print(f"{Fore.CYAN}Risk/Reward:  1:1.5")
+        print(f"{Fore.GREEN}{'='*90}")
+        
+    def check_positions(self):
+        for pos in self.positions[:]:
+            try:
+                price = self.exchange.fetch_ticker(pos['symbol'])['last']
+                current_pnl = (price - pos['price']) * pos['qty']
+                current_pnl_pct = ((price - pos['price']) / pos['price']) * 100
+                
+                if price <= pos['stop']:
+                    pnl = (price - pos['price']) * pos['qty'] - (pos['price']*pos['qty']*0.002)
+                    pnl_pct = ((price - pos['price']) / pos['price']) * 100
+                    self.balance += price * pos['qty'] + pnl
+                    self.trades.append({'pnl':pnl, 'pnl_pct': pnl_pct, 'type': 'STOP LOSS'})
+                    
+                    print(f"\n{Fore.RED}{'='*90}")
+                    print(f"{Fore.RED}✗ STOP LOSS HIT")
+                    print(f"{Fore.RED}{'='*90}")
+                    print(f"Symbol:      {pos['symbol']}")
+                    print(f"Entry:       ${pos['price']:,.2f}")
+                    print(f"Exit:        ${price:,.2f}  ({pnl_pct:.2f}%)")
+                    print(f"P&L:         ${pnl:.2f}")
+                    print(f"Balance:     ${self.balance:,.2f}")
+                    print(f"{Fore.RED}{'='*90}")
+                    self.positions.remove(pos)
+                    
+                elif price >= pos['target']:
+                    pnl = (price - pos['price']) * pos['qty'] - (pos['price']*pos['qty']*0.002)
+                    pnl_pct = ((price - pos['price']) / pos['price']) * 100
+                    self.balance += price * pos['qty'] + pnl
+                    self.trades.append({'pnl':pnl, 'pnl_pct': pnl_pct, 'type': 'TAKE PROFIT'})
+                    
+                    print(f"\n{Fore.GREEN}{'='*90}")
+                    print(f"{Fore.GREEN}✓ TAKE PROFIT HIT")
+                    print(f"{Fore.GREEN}{'='*90}")
+                    print(f"Symbol:      {pos['symbol']}")
+                    print(f"Entry:       ${pos['price']:,.2f}")
+                    print(f"Exit:        ${price:,.2f}  (+{pnl_pct:.2f}%)")
+                    print(f"P&L:         ${pnl:.2f}")
+                    print(f"Balance:     ${self.balance:,.2f}")
+                    print(f"{Fore.GREEN}{'='*90}")
+                    self.positions.remove(pos)
+                    
+                elif (datetime.now()-pos['time']).seconds > 300:
+                    pnl = (price - pos['price']) * pos['qty'] - (pos['price']*pos['qty']*0.002)
+                    pnl_pct = ((price - pos['price']) / pos['price']) * 100
+                    self.balance += price * pos['qty'] + pnl
+                    self.trades.append({'pnl':pnl, 'pnl_pct': pnl_pct, 'type': 'TIMEOUT'})
+                    
+                    color = Fore.GREEN if pnl > 0 else Fore.RED
+                    print(f"\n{color}{'='*90}")
+                    print(f"{color}⏱ TIMEOUT - Position Closed")
+                    print(f"{color}{'='*90}")
+                    print(f"Symbol:      {pos['symbol']}")
+                    print(f"Entry:       ${pos['price']:,.2f}")
+                    print(f"Exit:        ${price:,.2f}  ({pnl_pct:+.2f}%)")
+                    print(f"P&L:         ${pnl:.2f}")
+                    print(f"Balance:     ${self.balance:,.2f}")
+                    print(f"{color}{'='*90}")
+                    self.positions.remove(pos)
+                    
+            except: pass
+    
+    def show_stats(self):
+        if self.trades:
+            wins = [t for t in self.trades if t['pnl']>0]
+            total_pnl = sum(t['pnl'] for t in self.trades)
+            roi = ((self.balance-self.initial)/self.initial)*100
+            avg_win_pct = sum(t['pnl_pct'] for t in wins)/len(wins) if wins else 0
+            avg_loss_pct = sum(t['pnl_pct'] for t in self.trades if t['pnl']<0)/len([t for t in self.trades if t['pnl']<0]) if [t for t in self.trades if t['pnl']<0] else 0
+            
+            print(f"\n{Fore.CYAN}{'='*90}")
+            print(f"{Fore.YELLOW}📈 PERFORMANCE STATISTICS")
+            print(f"{Fore.CYAN}{'='*90}")
+            print(tabulate([
+                ['Current Balance', f"${self.balance:,.2f}"],
+                ['Initial Balance', f"${self.initial:,.2f}"],
+                ['Total P&L', f"${total_pnl:,.2f}"],
+                ['ROI', f"{roi:+.2f}%"],
+                ['Total Trades', len(self.trades)],
+                ['Wins', len(wins)],
+                ['Losses', len(self.trades) - len(wins)],
+                ['Win Rate', f"{len(wins)/len(self.trades)*100:.1f}%"],
+                ['Avg Win %', f"+{avg_win_pct:.2f}%"],
+                ['Avg Loss %', f"{avg_loss_pct:.2f}%"]
+            ], tablefmt='grid'))
+            print(f"{Fore.CYAN}{'='*90}")
+    
+    def run(self):
+        print(f"{Fore.CYAN}{'='*90}\n{Fore.YELLOW}PAPER TRADING SIMULATOR - Gate.io\n{Fore.WHITE}Starting Balance: ${self.initial:,.2f} (VIRTUAL)\n{Fore.CYAN}{'='*90}\n")
+        try:
+            while True:
+                print(f"{Fore.MAGENTA}[{datetime.now().strftime('%H:%M:%S')}] Checking markets...")
+                self.check_positions()
+                
+                if len(self.positions) < 3 and len(self.trades) < 10:
+                    for sym in self.symbols:
+                        a = self.analyze(sym)
+                        if a and a['buy']:
+                            self.open_position(sym, a['price'])
+                        time.sleep(1)
+                
+                self.show_stats()
+                
+                if self.positions:
+                    print(f"\n{Fore.YELLOW}📊 Active Positions:")
+                    for p in self.positions:
+                        try:
+                            curr = self.exchange.fetch_ticker(p['symbol'])['last']
+                            pnl_pct = ((curr - p['price']) / p['price']) * 100
+                            color = Fore.GREEN if pnl_pct > 0 else Fore.RED
+                            print(f"{color}{p['symbol']}: Entry ${p['price']:,.2f} → Now ${curr:,.2f} ({pnl_pct:+.2f}%)")
+                        except:
+                            pass
+                
+                time.sleep(30)
+        except KeyboardInterrupt:
+            print(f"\n{Fore.YELLOW}Bot stopped.")
+            self.show_stats()
+
+if __name__ == "__main__":
+    PaperBot().run()
